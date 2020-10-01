@@ -74,7 +74,6 @@
 #include <unistd.h>
 #include <elf.h>
 #include <link.h>
-//#include <sys/link.h>
 
 #include "wine/asm.h"
 
@@ -99,7 +98,7 @@ struct wine_preload_info
 
 static struct wine_preload_info preload_info[] =
 {
-#ifdef __i386__
+#if defined(__i386__) || defined(COMPAT_MODE)
     { (void *)0x00000000, 0x00010000 },  /* low 64k */
     { (void *)0x00010000, 0x00100000 },  /* DOS area */
     { (void *)0x00110000, 0x67ef0000 },  /* low memory area */
@@ -114,11 +113,21 @@ static struct wine_preload_info preload_info[] =
     { 0, 0 }                             /* end of list */
 };
 
+#ifdef COMPAT_MODE
+struct wine_preload_info_compat
+{
+    unsigned int addr;
+    unsigned int size;
+};
+
+static struct wine_preload_info_compat preload_info_compat[6];
+#endif
+
 /* debugging */
 #undef DUMP_SEGMENTS
 #undef DUMP_AUX_INFO
 #undef DUMP_SYMS
-#undef DUMP_MAPS
+#define DUMP_MAPS
 
 /* older systems may not define these */
 #ifndef PT_TLS
@@ -139,6 +148,22 @@ static struct wine_preload_info preload_info[] =
 static size_t page_size, page_mask;
 static char *preloader_start, *preloader_end;
 
+struct wld_auxv
+{
+    ElfW(Addr) a_type;
+    union
+    {
+        ElfW(Addr) a_val;
+    } a_un;
+};
+
+
+#ifdef COMPAT_MODE
+#undef ElfW
+#define ElfW(type) _ELFW(Elf, 32, type)
+#define _ELFW(e, w, t) e##w##_##t
+#endif
+
 struct wld_link_map {
     ElfW(Addr) l_addr;
     ElfW(Dyn) *l_ld;
@@ -148,15 +173,6 @@ struct wld_link_map {
     ElfW(Half) l_phnum;
     ElfW(Addr) l_map_start, l_map_end;
     ElfW(Addr) l_interp;
-};
-
-struct wld_auxv
-{
-    ElfW(Addr) a_type;
-    union
-    {
-        ElfW(Addr) a_val;
-    } a_un;
 };
 
 /*
@@ -354,6 +370,7 @@ __ASM_GLOBAL_FUNC(_start,
                   "call wld_start\n\t"
                   "movq (%rsp),%rsp\n\t"     /* new stack pointer */
                   "pushq %rax\n\t"           /* ELF interpreter entry point */
+#ifndef COMPAT_MODE
                   "xorq %rax,%rax\n\t"
                   "xorq %rcx,%rcx\n\t"
                   "xorq %rdx,%rdx\n\t"
@@ -364,6 +381,19 @@ __ASM_GLOBAL_FUNC(_start,
                   "xorq %r10,%r10\n\t"
                   "xorq %r11,%r11\n\t"
                   "ret")
+#else
+                  "movl $0x23, 4(%rsp)\n\t"
+                  "movq %rsp, %r9\n\t"
+                  "leaq 8(%rsp),%rsp\n\t"
+                  "movw $0x2b, %ax\n\t"
+                  "movw %ax, %ds\n\t"
+                  "movw %ax, %ss\n\t"
+                  "movw %ax, %es\n\t"
+                  "xor %eax,%eax\n\t"
+                  "xor %ecx,%ecx\n\t"
+                  "xor %edx,%edx\n\t"
+                  "ljmp 0(%r9)")
+#endif
 
 #define SYSCALL_FUNC( name, nr ) \
     __ASM_GLOBAL_FUNC( name, \
@@ -398,7 +428,16 @@ int wld_close( int fd );
 SYSCALL_FUNC( wld_close, 3 /* SYS_close */ );
 
 void *wld_mmap( void *start, size_t len, int prot, int flags, int fd, off_t offset );
+#ifndef COMPAT_MODE
 SYSCALL_FUNC( wld_mmap, 9 /* SYS_mmap */ );
+#else
+void *wld_mmap_internal( void *start, size_t len, int prot, int flags, int fd, off_t offset );
+SYSCALL_FUNC( wld_mmap_internal, 9 /* SYS_mmap */ );
+void *wld_mmap( void *start, size_t len, int prot, int flags, int fd, off_t offset )
+{
+    return wld_mmap_internal(start, len, prot, flags|MAP_32BIT, fd, offset);
+}
+#endif
 
 int wld_mprotect( const void *addr, size_t len, int prot );
 SYSCALL_FUNC( wld_mprotect, 10 /* SYS_mprotect */ );
@@ -550,6 +589,14 @@ static inline void *wld_memset( void *dest, int val, size_t len )
     return dest;
 }
 
+static inline void *wld_memcpy( void *dest, const void *source, size_t len )
+{
+    char *dst = dest;
+    const char *src = source;
+    while (len--) dst[len] = src[len];
+    return dest;
+}
+
 /*
  * wld_printf - just the basics
  *
@@ -655,6 +702,10 @@ static void dump_auxiliary( struct wld_auxv *av )
         NAME(AT_SYSINFO),
         NAME(AT_SYSINFO_EHDR),
         NAME(AT_UID),
+        NAME(AT_SECURE),
+        NAME(AT_RANDOM),
+        NAME(AT_HWCAP2),
+        NAME(AT_EXECFN),
         { 0, NULL }
     };
 #undef NAME
@@ -751,6 +802,112 @@ static int get_auxiliary( struct wld_auxv *av, int type, int def_val )
   return def_val;
 }
 
+#ifdef COMPAT_MODE
+struct wld_auxv_compat
+{
+    ElfW(Addr) a_type;
+    union
+    {
+        ElfW(Addr) a_val;
+    } a_un;
+};
+
+/* send in av to avoid finding it twice */
+static void compat_convert_stack( void **stack, void *stack_top )
+{
+    char *dst;
+    void *src = *stack;
+    long *pargc;
+    char **argv_in, **env_in, **p;
+    ElfW(Addr) *env_out, *argv_out;
+    unsigned int env_count = 0;
+    struct wld_auxv *av_base_in, *av;
+    struct wld_auxv_compat *av_base_out;
+    unsigned int av_count = 0, i;
+    char *strings_base_in, *strings_base_out, *s;
+    unsigned int strings_len;
+
+    wld_printf("stack top = %p\n", stack_top);
+
+    dst = (char*) wld_mmap(NULL, 0x800000, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    dst += 0x800000;
+
+    /* reformat stack for 32-bit */
+    pargc = src;
+    argv_in = (char **)pargc + 1;
+
+    p = argv_in + *pargc + 1;
+    env_in = p;
+
+    while (*p)
+    {
+        env_count++;
+        p++;
+    }
+    p++;
+
+    av_base_in = (struct wld_auxv *)p;
+    av = av_base_in;
+
+    while (av->a_type != AT_NULL)
+    {
+        av_count++;
+        av++;
+    }
+    av++;
+
+    strings_base_in = (char*) av;
+    strings_len = (char*) stack_top - strings_base_in;
+
+    /* copy string table */
+    dst -= strings_len;
+    strings_base_out = dst;
+    wld_memcpy(strings_base_out, strings_base_in, strings_len);
+
+    /* copy auxiliary vectors */
+    dst -= (av_count + 1) * sizeof(struct wld_auxv_compat);
+    av_base_out = dst;
+
+    for (i = 0; i < av_count + 1; i++)
+    {
+        av_base_out[i].a_type = av_base_in[i].a_type;
+        if (av_base_in[i].a_un.a_val <= (unsigned int)-1)
+            av_base_out[i].a_un.a_val = av_base_in[i].a_un.a_val;
+        else if (av_base_in[i].a_un.a_val >= strings_base_in && av_base_in[i].a_un.a_val < strings_base_in + strings_len)
+        {
+            av_base_out[i].a_un.a_val = (char*)av_base_in[i].a_un.a_val - strings_base_in + strings_base_out;
+        }
+        else
+            wld_printf("ERROR: auxiliary vector contains pointer %p outside of stack, can't convert!\n", (void*)av_base_in[i].a_un.a_val);
+    }
+
+    dst -= (env_count + 1) * sizeof(ElfW(Addr));
+    env_out = dst;
+    for (i = 0; i < env_count; i++)
+    {
+        if (env_in[i] < strings_base_in || env_in[i] >= strings_base_in + strings_len)
+            wld_printf("ERROR: invalid string pointer %p\n", env_in[i]);
+        env_out[i] = (ElfW(Addr))(env_in[i] - strings_base_in + strings_base_out);
+    }
+    env_out[env_count] = env_in[env_count];
+
+    dst -= (*pargc + 1) * sizeof(ElfW(Addr));
+    argv_out = dst;
+    for (i = 0; i < (*pargc); i++)
+    {
+        if (argv_in[i] < strings_base_in || argv_in[i] >= strings_base_in + strings_len)
+            wld_printf("ERROR: invalid string pointer %p\n", argv_in[i]);
+        argv_out[i] = argv_in[i] - strings_base_in + strings_base_out;
+    }
+    argv_out[*pargc] = argv_in[*pargc];
+
+    dst -= sizeof(ElfW(Addr));
+    *(int *)(dst) = *pargc;
+
+    *stack = dst;
+}
+#endif
+
 /*
  * map_so_lib
  *
@@ -792,8 +949,13 @@ static void map_so_lib( const char *name, struct wld_link_map *l)
     if( header->e_machine != EM_386 )
         fatal_error("%s: not an i386 ELF binary... don't know how to load it\n", name );
 #elif defined(__x86_64__)
+#ifdef COMPAT_MODE
+    if( header->e_machine != EM_386 )
+        fatal_error("%s: not an i386 ELF binary... don't know how to load it\n", name );
+#else
     if( header->e_machine != EM_X86_64 )
         fatal_error("%s: not an x86-64 ELF binary... don't know how to load it\n", name );
+#endif
 #elif defined(__aarch64__)
     if( header->e_machine != EM_AARCH64 )
         fatal_error("%s: not an aarch64 ELF binary... don't know how to load it\n", name );
@@ -845,7 +1007,7 @@ static void map_so_lib( const char *name, struct wld_link_map *l)
         case PT_LOAD:
           {
             if ((ph->p_align & page_mask) != 0)
-              fatal_error( "%s: ELF load command alignment not page-aligned\n", name );
+              fatal_error( "%s: ELF load command alignment not page-aligned. %lx %lx\n", name );
 
             if (((ph->p_vaddr - ph->p_offset) & (ph->p_align - 1)) != 0)
               fatal_error( "%s: ELF load command address/offset not properly aligned\n", name );
@@ -1243,14 +1405,20 @@ static void set_process_name( int argc, char *argv[] )
 void* wld_start( void **stack )
 {
     long i, *pargc;
+    void *stack_top;
     char **argv, **p;
     char *interp, *reserve = NULL;
     struct wld_auxv new_av[8], delete_av[3], *av;
     struct wld_link_map main_binary_map, ld_so_map;
+#ifndef COMPAT_MODE
     struct wine_preload_info **wine_main_preload_info;
+#else
+    struct wine_preload_info_compat **wine_main_preload_info;
+#endif
 
     pargc = *stack;
     argv = (char **)pargc + 1;
+    wld_printf("pargv %p argv %p %s\n", pargc, argv, argv[0]);
     if (*pargc < 2) fatal_error( "Usage: %s wine_binary [args]\n", argv[0] );
 
     /* skip over the parameters */
@@ -1317,7 +1485,19 @@ void* wld_start( void **stack )
 
     /* store pointer to the preload info into the appropriate main binary variable */
     wine_main_preload_info = find_symbol( &main_binary_map, "wine_main_preload_info", STT_OBJECT );
-    if (wine_main_preload_info) *wine_main_preload_info = preload_info;
+    if (wine_main_preload_info)
+    {
+#ifndef COMPAT_MODE
+        *wine_main_preload_info = preload_info;
+#else
+        for (i = 0; i < 6; i++)
+        {
+            preload_info_compat[i].addr = (unsigned int)(size_t) preload_info[i].addr;
+            preload_info_compat[i].size = (unsigned int) preload_info[i].size;
+        }
+        *wine_main_preload_info = preload_info_compat;
+#endif
+    }
     else wld_printf( "wine_main_preload_info not found\n" );
 
 #define SET_NEW_AV(n,type,val) new_av[n].a_type = (type); new_av[n].a_un.a_val = (val);
@@ -1333,7 +1513,13 @@ void* wld_start( void **stack )
 
     i = 0;
     /* delete sysinfo values if addresses conflict */
-    if (is_in_preload_range( av, AT_SYSINFO ) || is_in_preload_range( av, AT_SYSINFO_EHDR ))
+    if (is_in_preload_range( av, AT_SYSINFO ) || is_in_preload_range( av, AT_SYSINFO_EHDR ) ||
+#ifdef COMPAT_MODE
+        1
+#else
+        0
+#endif
+    )
     {
         delete_av[i++].a_type = AT_SYSINFO;
         delete_av[i++].a_type = AT_SYSINFO_EHDR;
@@ -1342,10 +1528,14 @@ void* wld_start( void **stack )
 
     /* get rid of first argument */
     set_process_name( *pargc, argv );
+    stack_top = (void*)((pargc[1] + page_mask) & ~page_mask);
     pargc[1] = pargc[0] - 1;
     *stack = pargc + 1;
 
     set_auxiliary_values( av, new_av, delete_av, stack );
+#ifdef COMPAT_MODE
+    compat_convert_stack( stack, stack_top );
+#endif
 
 #ifdef DUMP_AUX_INFO
     wld_printf("new stack = %p\n", *stack);
